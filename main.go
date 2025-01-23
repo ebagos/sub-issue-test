@@ -4,52 +4,54 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 
-	"github.com/shurcooL/githubv4" // GitHub V4 APIクライアントライブラリ
-	"golang.org/x/oauth2"          // OAuth2認証用ライブラリ
+	"github.com/joho/godotenv"
+	"github.com/shurcooL/githubv4"
+	"golang.org/x/oauth2"
 )
 
-// GraphQLクエリを定義する構造体
-type query struct {
-	Node struct {
+type issueQuery struct {
+	Repository struct {
 		Issue struct {
+			Id     githubv4.ID
 			Title  githubv4.String
 			Parent struct {
-				Issue struct {
-					Number githubv4.Int
-					Title  githubv4.String
-				}
-			} `graphql:"parent"` // 親issueの情報を取得するためのフィールド
-		} `graphql:"... on Issue"` // Issue型に限定
-	} `graphql:"node(id: $issueID)"` // 指定したIDのノードを取得
+				Number githubv4.Int
+				Title  githubv4.String
+			} `graphql:"parent"`
+		} `graphql:"issue(number: $issueNumber)"`
+	} `graphql:"repository(owner: $owner, name: $name)"`
 }
 
 func main() {
-	// GitHubアクセストークンを設定
+	godotenv.Load()
+	org := os.Getenv("ORG")
+	repo := os.Getenv("REPO")
+	noString := os.Getenv("ISSUE_NO")
+	no, err := strconv.Atoi(noString)
+	if err != nil {
+		panic(err)
+	}
 	src := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: os.Getenv("GITHUB_TOKEN")}, // 環境変数からアクセストークンを取得
+		&oauth2.Token{AccessToken: os.Getenv("GITHUB_TOKEN")},
 	)
 	httpClient := oauth2.NewClient(context.Background(), src)
-
-	// GitHub V4 APIクライアントを作成
 	client := githubv4.NewClient(httpClient)
 
-	// sub-issueのIDを設定
-	var issueID githubv4.ID
-	fmt.Print("Sub-issue ID: ")
-	fmt.Scanln(&issueID)
+	var q issueQuery
+	variables := map[string]interface{}{
+		"owner":       githubv4.String(org),
+		"name":        githubv4.String(repo),
+		"issueNumber": githubv4.Int(no),
+	}
 
-	// クエリを実行
-	var q query
-	err := client.Query(context.Background(), &q, mapinterface{}{
-		"issueID": issueID, // クエリ変数にsub-issueのIDを設定
-	})
+	err = client.Query(context.Background(), &q, variables)
 	if err != nil {
 		panic(err)
 	}
 
-	// 親issueの情報を表示
 	fmt.Println("Parent Issue:")
-	fmt.Println("  Number:", q.Node.Issue.Parent.Issue.Number)
-	fmt.Println("  Title:", q.Node.Issue.Parent.Issue.Title)
+	fmt.Println("  Number:", q.Repository.Issue.Parent.Number)
+	fmt.Println("  Title:", q.Repository.Issue.Parent.Title)
 }

@@ -1,0 +1,762 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+)
+
+const (
+	estimatedLabel  = "見積時間"
+	actualLabel     = "実績時間"
+	sbiLabel        = "sbi"
+	devSbiLabel     = "dev-sbi"
+	pbiLabel        = "pbi"
+	devPbiLabel     = "dev-pbi"
+	diffLowLabel    = "Difficulty:Low"
+	diffMiddleLabel = "Difficulty:Middle"
+	diffHighLabel   = "Difficulty:High"
+	jstOffset       = 9 * 60 * 60 // JSTは UTC+9時間
+)
+
+// JSTの定義（パッケージレベルで定義）
+var jst = time.FixedZone("JST", jstOffset)
+
+// IssueTimeInfo はIssueの時間情報を格納する構造体
+type IssueTimeInfo struct {
+	IssueURL      string     `json:"issue_url"`
+	Title         string     `json:"title"`
+	Author        string     `json:"author"`
+	Assignees     []string   `json:"assignees"`
+	CreatedAt     time.Time  `json:"created_at"` // nilにならないように値型にする
+	ClosedAt      *time.Time `json:"closed_at"`  // 閉じていない場合はnilになるためポインタ
+	State         string     `json:"state"`
+	StateReason   string     `json:"state_reason"`
+	EstimatedTime float64    `json:"estimated_time"`
+	ActualTime    float64    `json:"actual_time"`
+	Size          float64    `json:"size"` // 追加: サイズ
+	Labels        []string   `json:"labels"`
+}
+
+// GraphQLClient はGraphQL APIへのリクエストを処理する簡易クライアント
+type GraphQLClient struct {
+	httpClient *http.Client
+	endpoint   string
+	token      string
+}
+
+// GraphQLRequest はGraphQLリクエストを表す構造体
+type GraphQLRequest struct {
+	Query     string                 `json:"query"`
+	Variables map[string]interface{} `json:"variables"`
+}
+
+// GraphQLResponse はGraphQLレスポンスを表す構造体
+type GraphQLResponse struct {
+	Data   json.RawMessage `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// ProjectQueryResponse はプロジェクトクエリのレスポンス構造
+type ProjectQueryResponse struct {
+	Organization struct {
+		ProjectV2 struct {
+			Title string
+			Items struct {
+				PageInfo struct {
+					HasNextPage bool
+					EndCursor   *string
+				}
+				Nodes []struct {
+					Content struct {
+						TypeName    string `json:"__typename"`
+						Number      int
+						Title       string
+						State       string
+						StateReason *string
+						Author      struct {
+							Login string
+						}
+						Labels struct {
+							Nodes []struct {
+								Name string
+							}
+						}
+						Assignees struct {
+							Nodes []struct {
+								Login string
+							}
+						}
+						URL        string
+						Repository struct {
+							Name string
+						}
+						CreatedAt string // Issueの作成日時
+						ClosedAt  *string
+					} `json:"content"`
+					FieldValues struct {
+						Nodes []struct {
+							TypeName string `json:"__typename"`
+							// 数値フィールド用（見積時間、実績時間など）
+							Field struct {
+								Name string
+							} `json:"field,omitempty"`
+							Number *float64 `json:"number,omitempty"`
+							// 以下は他のフィールドタイプ用だが、今回は使用しない
+							Name  *string `json:"name,omitempty"`
+							Title string  `json:"title,omitempty"`
+							Text  string  `json:"text,omitempty"`
+							Date  string  `json:"date,omitempty"`
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// FilterOptions は複数のフィルタリングオプションを格納する構造体
+type FilterOptions struct {
+	ClosedDateRange     *DateRange    // 閉じられた日付の範囲
+	CreatedAfterDate    *time.Time    // 指定日以降に作成された
+	IncludeOpenIssues   bool          // 未閉じIssueを含むか
+	WeeklyPeriod        *WeeklyPeriod // 週次期間
+	RequireSbiLabel     bool          // "sbi"ラベルが必要か
+	ExcludeNotPlanned   bool          // "NOT_PLANNED"で閉じられたIssueを除外するか
+	AllowedRepositories []string      // 対象リポジトリのリスト
+}
+
+// DateRange は日付範囲を表す構造体
+type DateRange struct {
+	StartDate time.Time
+	EndDate   time.Time
+}
+
+// WeeklyPeriod は週間期間を表す構造体
+type WeeklyPeriod struct {
+	StartDate time.Time
+	EndDate   time.Time
+	Weekday   int
+}
+
+// NewGraphQLClient は新しいGraphQLクライアントを作成する
+func NewGraphQLClient(token string) *GraphQLClient {
+	return &GraphQLClient{
+		httpClient: &http.Client{},
+		endpoint:   "https://api.github.com/graphql",
+		token:      token,
+	}
+}
+
+// Execute はGraphQLクエリを実行する
+func (c *GraphQLClient) Execute(ctx context.Context, query string, variables map[string]interface{}, responseData interface{}) error {
+	// リクエストの準備
+	req := GraphQLRequest{
+		Query:     query,
+		Variables: variables,
+	}
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshaling request: %w", err)
+	}
+
+	// HTTPリクエストの作成
+	httpReq, err := http.NewRequest("POST", c.endpoint, strings.NewReader(string(reqBody)))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "bearer "+c.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	// リクエストの実行
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// レスポンスの解析
+	var graphqlResp GraphQLResponse
+	if err := json.NewDecoder(resp.Body).Decode(&graphqlResp); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+
+	// エラーチェック
+	if len(graphqlResp.Errors) > 0 {
+		return fmt.Errorf("graphql errors: %s", graphqlResp.Errors[0].Message)
+	}
+
+	// データの解析
+	if err := json.Unmarshal(graphqlResp.Data, responseData); err != nil {
+		return fmt.Errorf("unmarshaling data: %w", err)
+	}
+
+	return nil
+}
+
+// parseJSTDate はJSTタイムゾーンで日付を解析する
+func parseJSTDate(dateStr string) (time.Time, error) {
+	return time.ParseInLocation("2006-01-02", dateStr, jst)
+}
+
+// calculateWeeklyPeriod は昨日を含む週の特定曜日からの1週間の期間を計算する
+func calculateWeeklyPeriod(weekday int) WeeklyPeriod {
+	// 昨日の日時（JST）
+	yesterday := time.Now().In(jst).AddDate(0, 0, -1)
+
+	// 昨日が含まれる週の開始曜日を計算
+	daysSinceTargetWeekday := (int(yesterday.Weekday()) - weekday + 7) % 7
+	lastTargetWeekday := yesterday.AddDate(0, 0, -daysSinceTargetWeekday)
+
+	// 時刻部分をリセットして、その日の00:00:00に設定
+	lastTargetWeekday = time.Date(
+		lastTargetWeekday.Year(), lastTargetWeekday.Month(), lastTargetWeekday.Day(),
+		0, 0, 0, 0, jst)
+
+	// 次の週の同じ曜日(期間の終了日は含まない)
+	// 7日後の00:00:00が終了時刻、つまり前日の23:59:59までが対象
+	nextWeekSameDay := lastTargetWeekday.AddDate(0, 0, 7)
+
+	return WeeklyPeriod{
+		StartDate: lastTargetWeekday,
+		EndDate:   nextWeekSameDay,
+		Weekday:   weekday,
+	}
+}
+
+func main() {
+	// 環境変数のロード
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using existing environment variables")
+	}
+
+	// 必要な環境変数の取得
+	org := os.Getenv("ORG")
+	if org == "" {
+		log.Fatal("ORG environment variable must be set")
+	}
+
+	projectStr := os.Getenv("PROJECT")
+	if projectStr == "" {
+		log.Fatal("PROJECT environment variable must be set")
+	}
+	projectNum, err := strconv.Atoi(projectStr)
+	if err != nil {
+		log.Fatalf("Invalid PROJECT number: %v", err)
+	}
+
+	reposStr := os.Getenv("REPOS")
+	if reposStr == "" {
+		log.Fatal("REPOS environment variable must be set")
+	}
+	repos := strings.Split(reposStr, ",")
+	// リポジトリ名をトリム
+	for i := range repos {
+		repos[i] = strings.TrimSpace(repos[i])
+	}
+
+	// サイズのカスタムフィールド名を環境変数から取得
+	sizeLabel := os.Getenv("SIZE_LABEL")
+	if sizeLabel == "" {
+		log.Fatal("SIZE_LABEL environment variable must be set")
+	}
+
+	// フィルターオプションの作成
+	filterOptions := FilterOptions{
+		IncludeOpenIssues:   false, // 閉じられたIssueのみを対象とする
+		RequireSbiLabel:     false, // すべてのIssueを対象とする
+		ExcludeNotPlanned:   true,  // "NOT_PLANNED"で閉じられたIssueを除外
+		AllowedRepositories: repos, // 対象リポジトリ
+	}
+
+	// 日付フィルタの取得と解析 - 必須項目として扱う
+	startDateStr := os.Getenv("START_DATE")
+	if startDateStr == "" {
+		log.Fatal("START_DATE environment variable must be set")
+	}
+
+	endDateStr := os.Getenv("END_DATE")
+	if endDateStr == "" {
+		log.Fatal("END_DATE environment variable must be set")
+	}
+
+	startDate, err := parseJSTDate(startDateStr)
+	if err != nil {
+		log.Fatalf("Invalid START_DATE format: %v", err)
+	}
+
+	endDate, err := parseJSTDate(endDateStr)
+	if err != nil {
+		log.Fatalf("Invalid END_DATE format: %v", err)
+	}
+	// 終了日の終わりまでを含めるために23:59:59に設定
+	endDate = endDate.Add(24*time.Hour - time.Second)
+
+	filterOptions.ClosedDateRange = &DateRange{
+		StartDate: startDate,
+		EndDate:   endDate,
+	}
+
+	// GitHubトークンの取得
+	token := getGitHubToken()
+
+	// GraphQLクライアントの初期化
+	client := NewGraphQLClient(token)
+	ctx := context.Background()
+
+	// プロジェクトからIssueを取得
+	allIssues, err := fetchAllProjectIssues(client, ctx, org, projectNum, sizeLabel)
+	if err != nil {
+		log.Fatalf("Error fetching issues from project: %v", err)
+	}
+
+	// フィルタリングを適用
+	filteredIssues := filterIssues(allIssues, filterOptions)
+
+	// 結果の出力
+	if len(filteredIssues) == 0 {
+		fmt.Printf("No issues found that were closed between %s and %s\n",
+			startDateStr, endDateStr)
+		return
+	}
+
+	fmt.Printf("Found %d issues closed between %s and %s in repositories: %s\n\n",
+		len(filteredIssues), startDateStr, endDateStr, strings.Join(repos, ", "))
+
+	// 入力チェックの実行と結果表示
+	validateAndDisplayIssuesWithIncorrectFields(filteredIssues)
+}
+
+// fetchAllProjectIssues はプロジェクトからすべてのIssueを取得する（フィルタリングなし）
+func fetchAllProjectIssues(client *GraphQLClient, ctx context.Context, org string, projectNum int, sizeLabel string) ([]IssueTimeInfo, error) {
+	var allIssues []IssueTimeInfo
+	cursor := ""
+
+	// GraphQLクエリの準備
+	query := `
+	query ProjectIssues($org: String!, $projectNum: Int!, $cursor: String) {
+		organization(login: $org) {
+			projectV2(number: $projectNum) {
+				title
+				items(first: 100, after: $cursor) {
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+					nodes {
+						content {
+							__typename
+							... on Issue {
+								number
+								title
+								state
+								stateReason
+								author {
+									login
+								}
+								labels(first: 100) {
+									nodes {
+										name
+									}
+								}
+								assignees(first: 10) {
+									nodes {
+										login
+									}
+								}
+								url
+								repository {
+									name
+								}
+								createdAt
+								closedAt
+							}
+						}
+						fieldValues(first: 100) {
+							nodes {
+								__typename
+								... on ProjectV2ItemFieldNumberValue {
+									field {
+										... on ProjectV2FieldCommon {
+											name
+										}
+									}
+									number
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	// ページネーション処理
+	for {
+		variables := map[string]interface{}{
+			"org":        org,
+			"projectNum": projectNum,
+		}
+
+		if cursor != "" {
+			variables["cursor"] = cursor
+		}
+
+		var response ProjectQueryResponse
+		err := client.Execute(ctx, query, variables, &response)
+		if err != nil {
+			return nil, fmt.Errorf("executing GraphQL query: %w", err)
+		}
+
+		// 各Issueを処理
+		for _, node := range response.Organization.ProjectV2.Items.Nodes {
+			// Issueでない場合はスキップ
+			if node.Content.TypeName != "Issue" {
+				continue
+			}
+
+			// 作成日時をパース
+			createdAtUTC, err := time.Parse(time.RFC3339, node.Content.CreatedAt)
+			if err != nil {
+				log.Printf("Error parsing createdAt time for issue #%d: %v", node.Content.Number, err)
+				continue
+			}
+			// UTCからJSTへ変換
+			createdAtJST := createdAtUTC.In(jst)
+
+			// 閉じられた日時をパース
+			var closedAt *time.Time
+			if node.Content.ClosedAt != nil {
+				// GitHubから返される時刻はUTCなのでパース後にJSTに変換
+				parsedTimeUTC, err := time.Parse(time.RFC3339, *node.Content.ClosedAt)
+				if err != nil {
+					log.Printf("Error parsing closedAt time for issue #%d: %v", node.Content.Number, err)
+					continue
+				}
+
+				// UTCからJSTに変換
+				parsedTimeJST := parsedTimeUTC.In(jst)
+				closedAt = &parsedTimeJST
+			}
+
+			// アサインされたユーザーの取得
+			assignees := make([]string, 0, len(node.Content.Assignees.Nodes))
+			for _, assignee := range node.Content.Assignees.Nodes {
+				assignees = append(assignees, assignee.Login)
+			}
+
+			// ラベルの取得
+			labels := make([]string, 0, len(node.Content.Labels.Nodes))
+			for _, label := range node.Content.Labels.Nodes {
+				labels = append(labels, label.Name)
+			}
+
+			// 状態理由の取得
+			stateReason := ""
+			if node.Content.StateReason != nil {
+				stateReason = *node.Content.StateReason
+			}
+
+			// カスタムフィールドから見積時間、実績時間、サイズを取得
+			estimatedTime, actualTime, size := -1.0, -1.0, -1.0
+
+			for _, fieldValue := range node.FieldValues.Nodes {
+				if fieldValue.TypeName == "ProjectV2ItemFieldNumberValue" && fieldValue.Number != nil {
+					switch fieldValue.Field.Name {
+					case estimatedLabel:
+						estimatedTime = *fieldValue.Number
+					case actualLabel:
+						actualTime = *fieldValue.Number
+					case sizeLabel:
+						size = *fieldValue.Number
+					}
+				}
+			}
+
+			// IssueTimeInfoの作成
+			issueInfo := IssueTimeInfo{
+				IssueURL:      node.Content.URL,
+				Title:         node.Content.Title,
+				Author:        node.Content.Author.Login,
+				Assignees:     assignees,
+				CreatedAt:     createdAtJST,
+				ClosedAt:      closedAt,
+				State:         node.Content.State,
+				StateReason:   stateReason,
+				EstimatedTime: estimatedTime,
+				ActualTime:    actualTime,
+				Size:          size,
+				Labels:        labels,
+			}
+
+			allIssues = append(allIssues, issueInfo)
+		}
+
+		// ページネーション処理
+		if !response.Organization.ProjectV2.Items.PageInfo.HasNextPage {
+			break
+		}
+
+		cursor = *response.Organization.ProjectV2.Items.PageInfo.EndCursor
+	}
+
+	return allIssues, nil
+}
+
+// filterIssues は指定されたフィルターオプションに基づいてIssueをフィルタリングする
+func filterIssues(issues []IssueTimeInfo, options FilterOptions) []IssueTimeInfo {
+	var filtered []IssueTimeInfo
+
+	for _, issue := range issues {
+		// リポジトリフィルター
+		if !isRepoInAllowedList(issue.IssueURL, options.AllowedRepositories) {
+			continue
+		}
+
+		// sbiラベルフィルター（今回は無効化してすべてのIssueを対象にする）
+		if options.RequireSbiLabel && !containsLabel(issue.Labels, sbiLabel) && !containsLabel(issue.Labels, devSbiLabel) {
+			continue
+		}
+
+		// NOT_PLANNEDでクローズされたIssueを除外
+		if options.ExcludeNotPlanned && issue.StateReason == "NOT_PLANNED" {
+			continue
+		}
+
+		// 閉じられたIssueのみを対象とする場合
+		if !options.IncludeOpenIssues && (issue.State != "CLOSED" || issue.ClosedAt == nil) {
+			continue
+		}
+
+		// 閉じられた日付の範囲フィルタリング
+		if options.ClosedDateRange != nil && issue.ClosedAt != nil {
+			if issue.ClosedAt.Before(options.ClosedDateRange.StartDate) ||
+				issue.ClosedAt.After(options.ClosedDateRange.EndDate) {
+				continue
+			}
+		}
+
+		filtered = append(filtered, issue)
+	}
+
+	return filtered
+}
+
+// isRepoInAllowedList はリポジトリが許可リスト内にあるかをURLから判断する
+func isRepoInAllowedList(issueURL string, allowedRepos []string) bool {
+	for _, repo := range allowedRepos {
+		repoURL := fmt.Sprintf("https://github.com/%s/%s", strings.Split(issueURL, "/")[3], repo)
+		if strings.HasPrefix(issueURL, repoURL) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsLabel は指定したラベルが含まれているかチェックする
+func containsLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if strings.EqualFold(label, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// getGitHubToken はGitHubトークンを環境変数またはファイルから取得する
+func getGitHubToken() string {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		fn := os.Getenv("GITHUB_TOKEN_FILE")
+		if fn == "" {
+			log.Fatal("Neither GITHUB_TOKEN nor GITHUB_TOKEN_FILE environment variables are set")
+		}
+
+		tmp, err := os.ReadFile(fn)
+		if err != nil {
+			log.Fatalf("Error reading token file: %v", err)
+		}
+		token = strings.TrimSpace(string(tmp))
+	}
+
+	if token == "" {
+		log.Fatal("GitHub token is empty")
+	}
+
+	return token
+}
+
+// hasAnySbiLabel はsbi関連のラベルが含まれているかチェックする
+func hasAnySbiLabel(labels []string) bool {
+	return containsLabel(labels, sbiLabel) || containsLabel(labels, devSbiLabel)
+}
+
+// hasAnyPbiLabel はpbi関連のラベルが含まれているかチェックする
+func hasAnyPbiLabel(labels []string) bool {
+	return containsLabel(labels, pbiLabel) || containsLabel(labels, devPbiLabel)
+}
+
+// getDifficultyFromLabels はラベルから難易度を特定する
+func getDifficultyFromLabels(labels []string) string {
+	if containsLabel(labels, diffLowLabel) {
+		return "Low"
+	} else if containsLabel(labels, diffMiddleLabel) {
+		return "Middle"
+	} else if containsLabel(labels, diffHighLabel) {
+		return "High"
+	}
+	return ""
+}
+
+// getResponsiblePerson は担当者（Assigneeまたは作成者）を返す
+func getResponsiblePerson(issue IssueTimeInfo) string {
+	if len(issue.Assignees) > 0 {
+		return strings.Join(issue.Assignees, ", ")
+	}
+	return issue.Author
+}
+
+// validateAndDisplayIssuesWithIncorrectFields はIssueのフィールド設定を検証し、
+// 不正な設定のIssueを表示する
+func validateAndDisplayIssuesWithIncorrectFields(issues []IssueTimeInfo) {
+	// クローズ理由でIssueを分類
+	var completedIssues []IssueTimeInfo
+	var otherIssues []IssueTimeInfo
+
+	for _, issue := range issues {
+		if issue.StateReason == "COMPLETED" {
+			completedIssues = append(completedIssues, issue)
+		} else {
+			otherIssues = append(otherIssues, issue)
+		}
+	}
+
+	// 各グループごとに検証と表示を行う
+	fmt.Println("\n## Issues Closed as COMPLETED")
+	validateAndDisplayIssueGroup(completedIssues)
+
+	fmt.Println("\n## Issues Closed with Other Reasons")
+	validateAndDisplayIssueGroup(otherIssues)
+}
+
+// validateAndDisplayIssueGroup は特定のグループのIssueを検証し表示する
+func validateAndDisplayIssueGroup(issues []IssueTimeInfo) {
+	var invalidIssues []struct {
+		Issue             IssueTimeInfo
+		Problems          []string
+		ResponsiblePerson string
+	}
+
+	for _, issue := range issues {
+		var problems []string
+
+		// SBIラベル（sbi, dev-sbi）を持つIssueは、見積時間・実績時間・難易度ラベルが設定されているべき
+		if hasAnySbiLabel(issue.Labels) {
+			if issue.EstimatedTime < 0 {
+				problems = append(problems, "見積時間が未設定")
+			}
+			if issue.ActualTime < 0 && issue.State == "CLOSED" {
+				problems = append(problems, "実績時間が未設定")
+			}
+
+			// 難易度ラベルのチェック
+			difficulty := getDifficultyFromLabels(issue.Labels)
+			if difficulty == "" {
+				problems = append(problems, "難易度ラベルが未設定")
+			}
+		}
+
+		// PBIラベル（pbi, dev-pbi）を持つIssueは、サイズが設定されているべき
+		if hasAnyPbiLabel(issue.Labels) {
+			if issue.Size < 0 {
+				problems = append(problems, "サイズが未設定")
+			}
+		}
+
+		if len(problems) > 0 {
+			invalidIssues = append(invalidIssues, struct {
+				Issue             IssueTimeInfo
+				Problems          []string
+				ResponsiblePerson string
+			}{
+				Issue:             issue,
+				Problems:          problems,
+				ResponsiblePerson: getResponsiblePerson(issue),
+			})
+		}
+	}
+
+	// 検証結果の出力
+	if len(invalidIssues) == 0 {
+		fmt.Printf("All %d issues have correct field values based on their labels. 👍\n", len(issues))
+		return
+	}
+
+	fmt.Printf("Found %d issues with incorrect or missing field values out of %d total issues\n\n",
+		len(invalidIssues), len(issues))
+	fmt.Printf("| %-50s | %-30s | %-40s |\n", "Issue", "Responsible Person", "Problems")
+	fmt.Println("|--------------------------------------------------|--------------------------------|------------------------------------------|")
+
+	for _, item := range invalidIssues {
+		issueTitle := item.Issue.Title
+		if len(issueTitle) > 45 {
+			issueTitle = issueTitle[:42] + "..."
+		}
+
+		// Markdown形式のリンクを作成
+		issueLink := fmt.Sprintf("[%s](%s)", issueTitle, item.Issue.IssueURL)
+
+		// 問題点のリスト
+		problemStr := strings.Join(item.Problems, ", ")
+
+		fmt.Printf("| %-50s | %-30s | %-40s |\n", issueLink, item.ResponsiblePerson, problemStr)
+	}
+
+	// サマリー情報
+	fmt.Printf("\n### Summary\n\n")
+	fmt.Printf("- Total issues with problems: %d (%.1f%%)\n",
+		len(invalidIssues), float64(len(invalidIssues))/float64(len(issues))*100)
+
+	// 問題の種類ごとの集計
+	problemCounts := make(map[string]int)
+	for _, item := range invalidIssues {
+		for _, problem := range item.Problems {
+			problemCounts[problem]++
+		}
+	}
+
+	fmt.Println("\n### Problem Types\n")
+	for problem, count := range problemCounts {
+		fmt.Printf("- %s: %d issues\n", problem, count)
+	}
+
+	// 責任者ごとの集計
+	personCounts := make(map[string]int)
+	for _, item := range invalidIssues {
+		personCounts[item.ResponsiblePerson]++
+	}
+
+	fmt.Println("\n### Issues by Responsible Person\n")
+	// キーでソートしてから出力
+	var persons []string
+	for person := range personCounts {
+		persons = append(persons, person)
+	}
+	sort.Strings(persons)
+
+	for _, person := range persons {
+		count := personCounts[person]
+		fmt.Printf("- %s: %d issues\n", person, count)
+	}
+}

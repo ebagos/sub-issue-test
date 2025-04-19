@@ -1,0 +1,257 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/shurcooL/githubv4"
+	"golang.org/x/oauth2"
+)
+
+// RoundTripper をラップして GraphQL-Features ヘッダーを付与
+type headerRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("GraphQL-Features", "sub_issues")
+	return h.rt.RoundTrip(req)
+}
+
+// すべてのIssueを取得するためのクエリ構造体
+type issuesListQuery struct {
+	Repository struct {
+		Issues struct {
+			Nodes []struct {
+				Number   githubv4.Int
+				ClosedAt githubv4.DateTime
+			}
+			PageInfo struct {
+				EndCursor   githubv4.String
+				HasNextPage bool
+			}
+		} `graphql:"issues(first: 100, after: $cursor, states: [CLOSED], filterBy: {since: $since})"`
+	} `graphql:"repository(owner: $owner, name: $name)"`
+}
+
+// 個別のIssueの詳細を取得するクエリ構造体
+type issueDetailQuery struct {
+	Repository struct {
+		Issue struct {
+			ID       githubv4.ID
+			Number   githubv4.Int
+			Title    githubv4.String
+			URL      githubv4.String
+			ClosedAt githubv4.DateTime
+			Parent   *struct {
+				ID     githubv4.ID
+				Number githubv4.Int
+			}
+		} `graphql:"issue(number: $number)"`
+	} `graphql:"repository(owner: $owner, name: $name)"`
+}
+
+// RootIssue型はルートIssueの情報を格納する構造体
+type RootIssue struct {
+	ID        string    `json:"id"`
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	URL       string    `json:"url"`
+	ClosedAt  time.Time `json:"closedAt"`
+	RepoName  string    `json:"repoName"`
+	RepoOwner string    `json:"repoOwner"`
+}
+
+func main() {
+	// .envファイルから環境変数を読み込む
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: .env file not found, using environment variables")
+	}
+
+	// GitHub Personal Access Tokenを取得
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		log.Fatal("GITHUB_TOKEN is required")
+	}
+
+	// 組織名を取得
+	org := os.Getenv("ORG")
+	if org == "" {
+		log.Fatal("ORG is required")
+	}
+
+	// リポジトリリストを取得
+	reposStr := os.Getenv("REPOS")
+	if reposStr == "" {
+		log.Fatal("REPOS is required")
+	}
+	repos := strings.Split(reposStr, ",")
+
+	// 開始日と終了日を取得（デフォルトは過去30日間）
+	startDateStr := os.Getenv("START_DATE")
+	endDateStr := os.Getenv("END_DATE")
+
+	var startDate, endDate time.Time
+	if startDateStr == "" {
+		// デフォルトは30日前
+		startDate = time.Now().AddDate(0, 0, -30)
+	} else {
+		startDate, err = time.Parse("2006-01-02", startDateStr)
+		if err != nil {
+			log.Fatalf("Invalid START_DATE format: %v", err)
+		}
+	}
+
+	if endDateStr == "" {
+		// デフォルトは現在
+		endDate = time.Now()
+	} else {
+		endDate, err = time.Parse("2006-01-02", endDateStr)
+		if err != nil {
+			log.Fatalf("Invalid END_DATE format: %v", err)
+		}
+	}
+
+	// GitHubクライアントの初期化
+	ctx := context.Background()
+	src := oauth2.StaticTokenSource(
+		&oauth2.Token{AccessToken: token},
+	)
+	httpClient := oauth2.NewClient(ctx, src)
+	// Sub-Issues機能を使用するためのヘッダーを追加
+	httpClient.Transport = headerRoundTripper{rt: httpClient.Transport}
+	client := githubv4.NewClient(httpClient)
+
+	// 全リポジトリからルートIssueを収集
+	rootIssues := []RootIssue{}
+	for _, repo := range repos {
+		log.Printf("Fetching issues for %s/%s...", org, repo)
+		issues, err := fetchRootIssues(client, org, repo, startDate, endDate)
+		if err != nil {
+			log.Printf("Error fetching issues for %s/%s: %v", org, repo, err)
+			continue
+		}
+		rootIssues = append(rootIssues, issues...)
+	}
+
+	// 結果を表示
+	printRootIssues(rootIssues)
+
+	// JSONファイルに保存
+	saveToJSON(rootIssues, "root_issues.json")
+}
+
+// fetchRootIssuesは指定されたリポジトリからルートIssueを取得する関数
+func fetchRootIssues(client *githubv4.Client, owner, repo string, startDate, endDate time.Time) ([]RootIssue, error) {
+	// 最初に指定期間内のクローズしたIssueリストを取得
+	issueNumbers, err := fetchClosedIssues(client, owner, repo, startDate, endDate)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("Found %d closed issues in %s/%s, checking for root issues...", len(issueNumbers), owner, repo)
+
+	// 各Issueが親Issueを持つかどうかを個別に確認し、ルートIssueを特定
+	rootIssues := []RootIssue{}
+	ctx := context.Background()
+
+	for _, issueNum := range issueNumbers {
+		var query issueDetailQuery
+		variables := map[string]interface{}{
+			"owner":  githubv4.String(owner),
+			"name":   githubv4.String(repo),
+			"number": issueNum,
+		}
+
+		err := client.Query(ctx, &query, variables)
+		if err != nil {
+			log.Printf("Error fetching issue #%d: %v", issueNum, err)
+			continue
+		}
+
+		// 親Issueを持たないIssueのみを抽出（ルートIssue）
+		if query.Repository.Issue.Parent == nil {
+			issue := query.Repository.Issue
+			rootIssues = append(rootIssues, RootIssue{
+				ID:        fmt.Sprintf("%v", issue.ID), // IDをstring型に変換
+				Number:    int(issue.Number),
+				Title:     string(issue.Title),
+				URL:       string(issue.URL),
+				ClosedAt:  issue.ClosedAt.Time,
+				RepoName:  repo,
+				RepoOwner: owner,
+			})
+		}
+	}
+
+	return rootIssues, nil
+}
+
+// fetchClosedIssuesは指定期間内にクローズしたIssueの番号リストを取得する関数
+func fetchClosedIssues(client *githubv4.Client, owner, repo string, startDate, endDate time.Time) ([]githubv4.Int, error) {
+	var query issuesListQuery
+	variables := map[string]interface{}{
+		"owner":  githubv4.String(owner),
+		"name":   githubv4.String(repo),
+		"cursor": (*githubv4.String)(nil),
+		"since":  githubv4.DateTime{Time: startDate},
+	}
+
+	issueNumbers := []githubv4.Int{}
+	ctx := context.Background()
+
+	for {
+		err := client.Query(ctx, &query, variables)
+		if err != nil {
+			return nil, fmt.Errorf("GraphQL query failed: %v", err)
+		}
+
+		for _, issue := range query.Repository.Issues.Nodes {
+			// 指定期間内にクローズされたIssueのみ対象とする
+			closedAt := issue.ClosedAt.Time
+			if closedAt.After(startDate) && closedAt.Before(endDate) {
+				issueNumbers = append(issueNumbers, issue.Number)
+			}
+		}
+
+		if !query.Repository.Issues.PageInfo.HasNextPage {
+			break
+		}
+		variables["cursor"] = githubv4.NewString(query.Repository.Issues.PageInfo.EndCursor)
+	}
+
+	return issueNumbers, nil
+}
+
+// printRootIssuesはルートIssueのリストを表示する関数
+func printRootIssues(issues []RootIssue) {
+	fmt.Printf("Found %d root issues:\n", len(issues))
+	for i, issue := range issues {
+		fmt.Printf("%d. [%s/%s#%d] %s (closed at %s)\n",
+			i+1, issue.RepoOwner, issue.RepoName, issue.Number, issue.Title, issue.ClosedAt.Format("2006-01-02"))
+	}
+}
+
+// saveToJSONはルートIssueのリストをJSONファイルに保存する関数
+func saveToJSON(issues []RootIssue, filename string) error {
+	data, err := json.MarshalIndent(issues, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON marshaling failed: %v", err)
+	}
+
+	err = os.WriteFile(filename, data, 0644)
+	if err != nil {
+		return fmt.Errorf("Writing to file failed: %v", err)
+	}
+
+	fmt.Printf("Root issues saved to %s\n", filename)
+	return nil
+}

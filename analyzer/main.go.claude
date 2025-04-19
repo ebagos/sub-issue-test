@@ -1,0 +1,1428 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+)
+
+const (
+	estimatedLabel  = "見積時間"
+	actualLabel     = "実績時間"
+	sbiLabel        = "sbi"
+	devSbiLabel     = "dev-sbi"
+	pbiLabel        = "pbi"
+	devPbiLabel     = "dev-pbi"
+	diffLowLabel    = "Difficulty:Low"
+	diffMiddleLabel = "Difficulty:Middle"
+	diffHighLabel   = "Difficulty:High"
+	jstOffset       = 9 * 60 * 60 // JSTは UTC+9時間
+)
+
+// JSTの定義（パッケージレベルで定義）
+var jst = time.FixedZone("JST", jstOffset)
+
+// IssueTimeInfo はIssueの時間情報を格納する構造体
+type IssueTimeInfo struct {
+	IssueURL      string     `json:"issue_url"`
+	IssueNumber   int        `json:"issue_number"`
+	Title         string     `json:"title"`
+	Author        string     `json:"author"`
+	Assignees     []string   `json:"assignees"`
+	CreatedAt     time.Time  `json:"created_at"` // nilにならないように値型にする
+	ClosedAt      *time.Time `json:"closed_at"`  // 閉じていない場合はnilになるためポインタ
+	State         string     `json:"state"`
+	StateReason   string     `json:"state_reason"`
+	EstimatedTime float64    `json:"estimated_time"`
+	ActualTime    float64    `json:"actual_time"`
+	Size          float64    `json:"size"` // 追加: サイズ
+	Labels        []string   `json:"labels"`
+	ParentURL     string     `json:"parent_url"` // 親IssueのURL
+	IsRoot        bool       `json:"is_root"`    // ルートIssueかどうか
+	RepoOwner     string     `json:"repo_owner"` // リポジトリオーナー
+	RepoName      string     `json:"repo_name"`  // リポジトリ名
+}
+
+// SubIssueRef はSub-Issueの参照情報を格納する構造体
+type SubIssueRef struct {
+	RepoOwner   string `json:"repo_owner"`
+	RepoName    string `json:"repo_name"`
+	IssueNumber int    `json:"issue_number"`
+	ParentURL   string `json:"parent_url"`
+}
+
+// GraphQLClient はGraphQL APIへのリクエストを処理する簡易クライアント
+type GraphQLClient struct {
+	httpClient *http.Client
+	endpoint   string
+	token      string
+}
+
+// GraphQLRequest はGraphQLリクエストを表す構造体
+type GraphQLRequest struct {
+	Query     string                 `json:"query"`
+	Variables map[string]interface{} `json:"variables"`
+}
+
+// GraphQLResponse はGraphQLレスポンスを表す構造体
+type GraphQLResponse struct {
+	Data   json.RawMessage `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// ProjectQueryResponse はプロジェクトクエリのレスポンス構造
+type ProjectQueryResponse struct {
+	Organization struct {
+		ProjectV2 struct {
+			Title string
+			Items struct {
+				PageInfo struct {
+					HasNextPage bool
+					EndCursor   *string
+				}
+				Nodes []struct {
+					Content struct {
+						TypeName    string `json:"__typename"`
+						Number      int
+						Title       string
+						State       string
+						StateReason *string
+						Author      struct {
+							Login string
+						}
+						Labels struct {
+							Nodes []struct {
+								Name string
+							}
+						}
+						Assignees struct {
+							Nodes []struct {
+								Login string
+							}
+						}
+						URL        string
+						Repository struct {
+							Name  string
+							Owner struct {
+								Login string
+							}
+						}
+						CreatedAt string
+						ClosedAt  *string
+						Parent    *struct {
+							URL    string
+							Number int
+							Title  string
+						} `json:"parent"`
+					} `json:"content"`
+					FieldValues struct {
+						Nodes []struct {
+							TypeName string `json:"__typename"`
+							Field    struct {
+								Name string
+							} `json:"field,omitempty"`
+							Number *float64 `json:"number,omitempty"`
+							Name   *string  `json:"name,omitempty"`
+							Title  string   `json:"title,omitempty"`
+							Text   string   `json:"text,omitempty"`
+							Date   string   `json:"date,omitempty"`
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// FilterOptions は複数のフィルタリングオプションを格納する構造体
+type FilterOptions struct {
+	ClosedDateRange     *DateRange    // 閉じられた日付の範囲
+	CreatedAfterDate    *time.Time    // 指定日以降に作成された
+	IncludeOpenIssues   bool          // 未閉じIssueを含むか
+	WeeklyPeriod        *WeeklyPeriod // 週次期間
+	RequireSbiLabel     bool          // "sbi"ラベルが必要か
+	ExcludeNotPlanned   bool          // "NOT_PLANNED"で閉じられたIssueを除外するか
+	AllowedRepositories []string      // 対象リポジトリのリスト
+	CompletedOnly       bool          // "COMPLETED"で閉じられたIssueだけを含めるか
+}
+
+// DateRange は日付範囲を表す構造体
+type DateRange struct {
+	StartDate time.Time
+	EndDate   time.Time
+}
+
+// WeeklyPeriod は週間期間を表す構造体
+type WeeklyPeriod struct {
+	StartDate time.Time
+	EndDate   time.Time
+	Weekday   int
+}
+
+// NewGraphQLClient は新しいGraphQLクライアントを作成する
+func NewGraphQLClient(token string) *GraphQLClient {
+	return &GraphQLClient{
+		httpClient: &http.Client{},
+		endpoint:   "https://api.github.com/graphql",
+		token:      token,
+	}
+}
+
+// Execute はGraphQLクエリを実行する（改良版）
+func (c *GraphQLClient) Execute(ctx context.Context, query string, variables map[string]interface{}, responseData interface{}) error {
+	// リクエストの準備
+	req := GraphQLRequest{
+		Query:     query,
+		Variables: variables,
+	}
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshaling request: %w", err)
+	}
+
+	// HTTPリクエストの作成
+	httpReq, err := http.NewRequest("POST", c.endpoint, strings.NewReader(string(reqBody)))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "bearer "+c.token)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	// Sub-Issue機能を有効にするためのヘッダー
+	httpReq.Header.Set("Accept", "application/vnd.github.v3+json")
+	// 最新のプレビュー機能を使用
+	httpReq.Header.Set("X-Github-Next-Global-ID", "1")
+
+	// リクエストの実行
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("executing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// デバッグのためにレスポンスボディを記録（大きすぎる場合は一部のみ）
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading response body: %w", err)
+	}
+
+	// ボディを新しいリーダーに置き換え（読み取り済みのため）
+	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	if resp.StatusCode >= 400 {
+		bodyPreview := string(bodyBytes)
+		if len(bodyPreview) > 500 {
+			bodyPreview = bodyPreview[:500] + "..."
+		}
+		log.Printf("API Error (Status %d): %s", resp.StatusCode, bodyPreview)
+		return fmt.Errorf("API error: status code %d", resp.StatusCode)
+	}
+
+	// レスポンスの解析
+	var graphqlResp GraphQLResponse
+	if err := json.NewDecoder(resp.Body).Decode(&graphqlResp); err != nil {
+		bodyPreview := string(bodyBytes)
+		if len(bodyPreview) > 500 {
+			bodyPreview = bodyPreview[:500] + "..."
+		}
+		log.Printf("JSON Decode Error: %s\nBody: %s", err, bodyPreview)
+		return fmt.Errorf("decoding response: %w", err)
+	}
+
+	// エラーチェック
+	if len(graphqlResp.Errors) > 0 {
+		var errorMessages []string
+		for _, err := range graphqlResp.Errors {
+			errorMessages = append(errorMessages, err.Message)
+		}
+		return fmt.Errorf("graphql errors: %s", strings.Join(errorMessages, "; "))
+	}
+
+	// データの解析
+	if err := json.Unmarshal(graphqlResp.Data, responseData); err != nil {
+		return fmt.Errorf("unmarshaling data: %w", err)
+	}
+
+	return nil
+}
+
+// parseJSTDate はJSTタイムゾーンで日付を解析する
+func parseJSTDate(dateStr string) (time.Time, error) {
+	return time.ParseInLocation("2006-01-02", dateStr, jst)
+}
+
+// calculateWeeklyPeriod は昨日を含む週の特定曜日からの1週間の期間を計算する
+func calculateWeeklyPeriod(weekday int) WeeklyPeriod {
+	// 昨日の日時（JST）
+	yesterday := time.Now().In(jst).AddDate(0, 0, -1)
+
+	// 昨日が含まれる週の開始曜日を計算
+	daysSinceTargetWeekday := (int(yesterday.Weekday()) - weekday + 7) % 7
+	lastTargetWeekday := yesterday.AddDate(0, 0, -daysSinceTargetWeekday)
+
+	// 時刻部分をリセットして、その日の00:00:00に設定
+	lastTargetWeekday = time.Date(
+		lastTargetWeekday.Year(), lastTargetWeekday.Month(), lastTargetWeekday.Day(),
+		0, 0, 0, 0, jst)
+
+	// 次の週の同じ曜日(期間の終了日は含まない)
+	// 7日後の00:00:00が終了時刻、つまり前日の23:59:59までが対象
+	nextWeekSameDay := lastTargetWeekday.AddDate(0, 0, 7)
+
+	return WeeklyPeriod{
+		StartDate: lastTargetWeekday,
+		EndDate:   nextWeekSameDay,
+		Weekday:   weekday,
+	}
+}
+
+// isRepoInAllowedList はリポジトリが許可リスト内にあるかをURLから判断する
+func isRepoInAllowedList(issueURL string, allowedRepos []string) bool {
+	urlParts := strings.Split(issueURL, "/")
+	if len(urlParts) < 5 {
+		return false
+	}
+
+	// URLからリポジトリ名を抽出
+	repoName := urlParts[4]
+
+	for _, repo := range allowedRepos {
+		if strings.EqualFold(repo, repoName) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseRepoInfoFromURL はIssue URLからリポジトリ情報を抽出する
+func parseRepoInfoFromURL(issueURL string) (string, string, int, error) {
+	// URLの形式: https://github.com/OWNER/REPO/issues/NUMBER
+	urlParts := strings.Split(issueURL, "/")
+	if len(urlParts) < 7 {
+		return "", "", 0, fmt.Errorf("invalid issue URL format: %s", issueURL)
+	}
+
+	repoOwner := urlParts[3]
+	repoName := urlParts[4]
+
+	issueNumStr := urlParts[6]
+	issueNum, err := strconv.Atoi(issueNumStr)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("invalid issue number in URL: %s", issueURL)
+	}
+
+	return repoOwner, repoName, issueNum, nil
+}
+
+// containsLabel は指定したラベルが含まれているかチェックする
+func containsLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if strings.EqualFold(label, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAnySbiLabel はsbi関連のラベルが含まれているかチェックする
+func hasAnySbiLabel(labels []string) bool {
+	return containsLabel(labels, sbiLabel) || containsLabel(labels, devSbiLabel)
+}
+
+// hasAnyPbiLabel はpbi関連のラベルが含まれているかチェックする
+func hasAnyPbiLabel(labels []string) bool {
+	return containsLabel(labels, pbiLabel) || containsLabel(labels, devPbiLabel)
+}
+
+// getDifficultyFromLabels はラベルから難易度を特定する
+func getDifficultyFromLabels(labels []string) string {
+	if containsLabel(labels, diffLowLabel) {
+		return "Low"
+	} else if containsLabel(labels, diffMiddleLabel) {
+		return "Middle"
+	} else if containsLabel(labels, diffHighLabel) {
+		return "High"
+	}
+	return ""
+}
+
+// getResponsiblePerson は担当者（Assigneeまたは作成者）を返す
+func getResponsiblePerson(issue IssueTimeInfo) string {
+	if len(issue.Assignees) > 0 {
+		return strings.Join(issue.Assignees, ", ")
+	}
+	return issue.Author
+}
+
+// getGitHubToken はGitHubトークンを環境変数またはファイルから取得する
+func getGitHubToken() string {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		fn := os.Getenv("GITHUB_TOKEN_FILE")
+		if fn == "" {
+			log.Fatal("Neither GITHUB_TOKEN nor GITHUB_TOKEN_FILE environment variables are set")
+		}
+
+		tmp, err := os.ReadFile(fn)
+		if err != nil {
+			log.Fatalf("Error reading token file: %v", err)
+		}
+		token = strings.TrimSpace(string(tmp))
+	}
+
+	if token == "" {
+		log.Fatal("GitHub token is empty")
+	}
+
+	return token
+}
+
+// derefStr はstring型のポインタを安全に参照する
+func derefStr(s *string) string {
+	if s != nil {
+		return *s
+	}
+	return ""
+}
+
+// 1. 指定期間にCOMPLETEDでクローズした全てのIssueを取得
+func fetchClosedIssuesInPeriod(client *GraphQLClient, ctx context.Context, org string, projectNum int, sizeLabel string, dateRange *DateRange, allowedRepos []string) ([]IssueTimeInfo, error) {
+	var completedIssues []IssueTimeInfo
+	cursor := ""
+
+	// GraphQLクエリの準備 - COMPLETEDでクローズされたIssueを取得
+	queryStr := `
+	query ProjectIssues($org: String!, $projectNum: Int!, $cursor: String) {
+		organization(login: $org) {
+			projectV2(number: $projectNum) {
+				title
+				items(first: 100, after: $cursor) {
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+					nodes {
+						content {
+							__typename
+							... on Issue {
+								number
+								title
+								state
+								stateReason
+								author {
+									login
+								}
+								labels(first: 100) {
+									nodes {
+										name
+									}
+								}
+								assignees(first: 10) {
+									nodes {
+										login
+									}
+								}
+								url
+								repository {
+									name
+									owner {
+										login
+									}
+								}
+								createdAt
+								closedAt
+								parent {
+									url
+									number
+									title
+								}
+							}
+						}
+						fieldValues(first: 100) {
+							nodes {
+								__typename
+								... on ProjectV2ItemFieldNumberValue {
+									field {
+										... on ProjectV2FieldCommon {
+											name
+										}
+									}
+									number
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	log.Println("Fetching COMPLETED issues in the specified period...")
+
+	// ページネーション処理
+	for {
+		variables := map[string]interface{}{
+			"org":        org,
+			"projectNum": projectNum,
+		}
+
+		if cursor != "" {
+			variables["cursor"] = cursor
+		}
+
+		var response ProjectQueryResponse
+		err := client.Execute(ctx, queryStr, variables, &response)
+		if err != nil {
+			return nil, fmt.Errorf("executing GraphQL query for completed issues: %w", err)
+		}
+
+		// 各Issueを処理
+		for _, node := range response.Organization.ProjectV2.Items.Nodes {
+			// Issueでない場合はスキップ
+			if node.Content.TypeName != "Issue" {
+				continue
+			}
+
+			// リポジトリフィルター
+			if !isRepoInAllowedList(node.Content.URL, allowedRepos) {
+				continue
+			}
+
+			// COMPLETEDでクローズされたIssueのみを対象とする
+			if node.Content.State != "CLOSED" || node.Content.StateReason == nil || *node.Content.StateReason != "COMPLETED" {
+				continue
+			}
+
+			// 閉じられた日付が範囲内かチェック
+			if node.Content.ClosedAt == nil {
+				continue
+			}
+
+			closedAtUTC, err := time.Parse(time.RFC3339, *node.Content.ClosedAt)
+			if err != nil {
+				log.Printf("Error parsing closedAt time for issue #%d: %v", node.Content.Number, err)
+				continue
+			}
+			closedAtJST := closedAtUTC.In(jst)
+
+			if closedAtJST.Before(dateRange.StartDate) || closedAtJST.After(dateRange.EndDate) {
+				continue
+			}
+
+			// 基本情報の処理
+			issueInfo := processIssueBasicInfo(node, sizeLabel)
+
+			completedIssues = append(completedIssues, issueInfo)
+		}
+
+		// ページネーション処理
+		if !response.Organization.ProjectV2.Items.PageInfo.HasNextPage {
+			break
+		}
+
+		cursor = *response.Organization.ProjectV2.Items.PageInfo.EndCursor
+	}
+
+	log.Printf("Found %d COMPLETED issues in the specified period", len(completedIssues))
+	return completedIssues, nil
+}
+
+// 2. ルートIssueを特定する
+func identifyRootIssues(issues []IssueTimeInfo) []IssueTimeInfo {
+	var rootIssues []IssueTimeInfo
+
+	for _, issue := range issues {
+		// ルートIssueの条件: 親がなく、pbi/dev-pbiラベルがある
+		if issue.ParentURL == "" && hasAnyPbiLabel(issue.Labels) {
+			issue.IsRoot = true
+			rootIssues = append(rootIssues, issue)
+		}
+	}
+
+	log.Printf("Identified %d root issues", len(rootIssues))
+	return rootIssues
+}
+
+// 3. 各ルートIssueのSub-Issueを取得する（リポジトリとIssue番号のみ）
+func getSubIssuesRefs(client *GraphQLClient, ctx context.Context, rootIssue IssueTimeInfo) ([]SubIssueRef, error) {
+	var subIssueRefs []SubIssueRef
+
+	// リポジトリ情報とIssue番号を取得
+	repoOwner, repoName, issueNumber, err := parseRepoInfoFromURL(rootIssue.IssueURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing repo info from URL: %w", err)
+	}
+
+	// GraphQLクエリ文字列
+	queryStr := `
+	query GetSubIssues($owner: String!, $repo: String!, $issueNumber: Int!) {
+		repository(owner: $owner, name: $repo) {
+			issue(number: $issueNumber) {
+				subIssues(first: 100) {
+					edges {
+						node {
+							number
+							title
+							state
+							repository {
+								name
+								owner {
+									login
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	variables := map[string]interface{}{
+		"owner":       repoOwner,
+		"repo":        repoName,
+		"issueNumber": issueNumber,
+	}
+
+	var response struct {
+		Repository struct {
+			Issue struct {
+				SubIssues struct {
+					Edges []struct {
+						Node struct {
+							Number     int
+							Title      string
+							State      string
+							Repository struct {
+								Name  string
+								Owner struct {
+									Login string
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("Fetching sub-issues for root issue #%d...", rootIssue.IssueNumber)
+
+	if err := client.Execute(ctx, queryStr, variables, &response); err != nil {
+		return nil, fmt.Errorf("executing GraphQL query for sub-issues: %w", err)
+	}
+
+	// Sub-Issue参照情報を収集
+	for _, edge := range response.Repository.Issue.SubIssues.Edges {
+		subNode := edge.Node
+		subRef := SubIssueRef{
+			RepoOwner:   subNode.Repository.Owner.Login,
+			RepoName:    subNode.Repository.Name,
+			IssueNumber: subNode.Number,
+			ParentURL:   rootIssue.IssueURL,
+		}
+		subIssueRefs = append(subIssueRefs, subRef)
+
+		// 再帰的にSub-Issueのさらに下の階層も取得
+		nestedSubRefs, err := getNestedSubIssueRefs(client, ctx, subNode.Repository.Owner.Login, subNode.Repository.Name, subNode.Number, rootIssue.IssueURL)
+		if err != nil {
+			log.Printf("Error fetching nested sub-issues for issue #%d: %v", subNode.Number, err)
+		} else {
+			subIssueRefs = append(subIssueRefs, nestedSubRefs...)
+		}
+	}
+
+	log.Printf("Found %d sub-issues (including nested) for root issue #%d", len(subIssueRefs), rootIssue.IssueNumber)
+	return subIssueRefs, nil
+}
+
+// ネストされたSub-Issueの参照情報を再帰的に取得
+func getNestedSubIssueRefs(client *GraphQLClient, ctx context.Context, repoOwner, repoName string, issueNumber int, rootURL string) ([]SubIssueRef, error) {
+	var subIssueRefs []SubIssueRef
+
+	// GraphQLクエリ文字列
+	queryStr := `
+	query GetNestedSubIssues($owner: String!, $repo: String!, $issueNumber: Int!) {
+		repository(owner: $owner, name: $repo) {
+			issue(number: $issueNumber) {
+				subIssues(first: 100) {
+					edges {
+						node {
+							number
+							title
+							state
+							repository {
+								name
+								owner {
+									login
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	variables := map[string]interface{}{
+		"owner":       repoOwner,
+		"repo":        repoName,
+		"issueNumber": issueNumber,
+	}
+
+	var response struct {
+		Repository struct {
+			Issue struct {
+				SubIssues struct {
+					Edges []struct {
+						Node struct {
+							Number     int
+							Title      string
+							State      string
+							Repository struct {
+								Name  string
+								Owner struct {
+									Login string
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if err := client.Execute(ctx, queryStr, variables, &response); err != nil {
+		return nil, err
+	}
+
+	// リンクを構築するためのURL
+	parentURL := fmt.Sprintf("https://github.com/%s/%s/issues/%d", repoOwner, repoName, issueNumber)
+
+	for _, edge := range response.Repository.Issue.SubIssues.Edges {
+		subNode := edge.Node
+		subRef := SubIssueRef{
+			RepoOwner:   subNode.Repository.Owner.Login,
+			RepoName:    subNode.Repository.Name,
+			IssueNumber: subNode.Number,
+			ParentURL:   parentURL, // 直接の親のURL
+		}
+		subIssueRefs = append(subIssueRefs, subRef)
+
+		// さらに下の階層を再帰的に取得
+		nestedSubRefs, err := getNestedSubIssueRefs(client, ctx, subNode.Repository.Owner.Login, subNode.Repository.Name, subNode.Number, rootURL)
+		if err != nil {
+			log.Printf("Error fetching nested sub-issues for issue #%d: %v", subNode.Number, err)
+		} else {
+			subIssueRefs = append(subIssueRefs, nestedSubRefs...)
+		}
+	}
+
+	return subIssueRefs, nil
+}
+
+// 4. 取得したSub-Issueの詳細情報を検索する
+func fetchSubIssueDetails(client *GraphQLClient, ctx context.Context, org string, projectNum int, subRefs []SubIssueRef, sizeLabel string) ([]IssueTimeInfo, error) {
+	var subIssueDetails []IssueTimeInfo
+
+	for _, subRef := range subRefs {
+		queryStr := `
+		query GetIssueDetails($org: String!, $projectNum: Int!, $owner: String!, $repo: String!, $number: Int!) {
+			organization(login: $org) {
+				projectV2(number: $projectNum) {
+					items(first: 10, filters: {
+						type: ISSUE,
+						filterBy: {
+							repository: {
+								owner: $owner,
+								name: $repo
+							},
+							number: {
+								eq: $number
+							}
+						}
+					}) {
+						nodes {
+							content {
+								__typename
+								... on Issue {
+									number
+									title
+									state
+									stateReason
+									author {
+										login
+									}
+									labels(first: 100) {
+										nodes {
+											name
+										}
+									}
+									assignees(first: 10) {
+										nodes {
+											login
+										}
+									}
+									url
+									repository {
+										name
+										owner {
+											login
+										}
+									}
+									createdAt
+									closedAt
+								}
+							}
+							fieldValues(first: 100) {
+								nodes {
+									__typename
+									... on ProjectV2ItemFieldNumberValue {
+										field {
+											... on ProjectV2FieldCommon {
+												name
+											}
+										}
+										number
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}`
+
+		variables := map[string]interface{}{
+			"org":        org,
+			"projectNum": projectNum,
+			"owner":      subRef.RepoOwner,
+			"repo":       subRef.RepoName,
+			"number":     subRef.IssueNumber,
+		}
+
+		var response struct {
+			Organization struct {
+				ProjectV2 struct {
+					Items struct {
+						Nodes []struct {
+							Content struct {
+								TypeName    string `json:"__typename"`
+								Number      int
+								Title       string
+								State       string
+								StateReason *string
+								Author      struct {
+									Login string
+								}
+								Labels struct {
+									Nodes []struct {
+										Name string
+									}
+								}
+								Assignees struct {
+									Nodes []struct {
+										Login string
+									}
+								}
+								URL        string
+								Repository struct {
+									Name  string
+									Owner struct {
+										Login string
+									}
+								}
+								CreatedAt string
+								ClosedAt  *string
+							}
+							FieldValues struct {
+								Nodes []struct {
+									TypeName string `json:"__typename"`
+									Field    struct {
+										Name string
+									}
+									Number *float64
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		log.Printf("Fetching details for sub-issue #%d...", subRef.IssueNumber)
+
+		if err := client.Execute(ctx, queryStr, variables, &response); err != nil {
+			log.Printf("Error fetching details for sub-issue #%d: %v", subRef.IssueNumber, err)
+			continue
+		}
+
+		// プロジェクト内にIssueがあるか確認
+		if len(response.Organization.ProjectV2.Items.Nodes) == 0 {
+			log.Printf("Sub-issue #%d not found in project", subRef.IssueNumber)
+			continue
+		}
+
+		// Issueの詳細情報を処理
+		for _, node := range response.Organization.ProjectV2.Items.Nodes {
+			if node.Content.TypeName != "Issue" {
+				continue
+			}
+
+			issueInfo := IssueTimeInfo{
+				IssueURL:    node.Content.URL,
+				IssueNumber: node.Content.Number,
+				Title:       node.Content.Title,
+				Author:      node.Content.Author.Login,
+				ParentURL:   subRef.ParentURL,
+				IsRoot:      false,
+				RepoOwner:   subRef.RepoOwner,
+				RepoName:    subRef.RepoName,
+				State:       node.Content.State,
+				StateReason: derefStr(node.Content.StateReason),
+			}
+
+			// 作成日時と閉じられた日時を処理
+			createdAtUTC, err := time.Parse(time.RFC3339, node.Content.CreatedAt)
+			if err != nil {
+				log.Printf("Error parsing createdAt time for issue #%d: %v", node.Content.Number, err)
+			} else {
+				issueInfo.CreatedAt = createdAtUTC.In(jst)
+			}
+
+			if node.Content.ClosedAt != nil {
+				closedAtUTC, err := time.Parse(time.RFC3339, *node.Content.ClosedAt)
+				if err != nil {
+					log.Printf("Error parsing closedAt time for issue #%d: %v", node.Content.Number, err)
+				} else {
+					closedAtJST := closedAtUTC.In(jst)
+					issueInfo.ClosedAt = &closedAtJST
+				}
+			}
+
+			// ラベルを処理
+			var labels []string
+			for _, label := range node.Content.Labels.Nodes {
+				labels = append(labels, label.Name)
+			}
+			issueInfo.Labels = labels
+
+			// アサインされたユーザーを処理
+			var assignees []string
+			for _, assignee := range node.Content.Assignees.Nodes {
+				assignees = append(assignees, assignee.Login)
+			}
+			issueInfo.Assignees = assignees
+
+			// カスタムフィールド値を処理
+			for _, fieldValue := range node.FieldValues.Nodes {
+				if fieldValue.TypeName == "ProjectV2ItemFieldNumberValue" && fieldValue.Number != nil {
+					switch fieldValue.Field.Name {
+					case estimatedLabel:
+						issueInfo.EstimatedTime = *fieldValue.Number
+					case actualLabel:
+						issueInfo.ActualTime = *fieldValue.Number
+					case sizeLabel:
+						issueInfo.Size = *fieldValue.Number
+					}
+				}
+			}
+
+			subIssueDetails = append(subIssueDetails, issueInfo)
+			break // 最初に見つかったIssueを使用
+		}
+	}
+
+	log.Printf("Fetched details for %d/%d sub-issues", len(subIssueDetails), len(subRefs))
+	return subIssueDetails, nil
+}
+
+// processIssueBasicInfo はIssueの基本情報を処理する共通関数
+func processIssueBasicInfo(node struct {
+	Content struct {
+		TypeName    string `json:"__typename"`
+		Number      int
+		Title       string
+		State       string
+		StateReason *string
+		Author      struct {
+			Login string
+		}
+		Labels struct {
+			Nodes []struct {
+				Name string
+			}
+		}
+		Assignees struct {
+			Nodes []struct {
+				Login string
+			}
+		}
+		URL        string
+		Repository struct {
+			Name  string
+			Owner struct {
+				Login string
+			}
+		}
+		CreatedAt string
+		ClosedAt  *string
+		Parent    *struct {
+			URL    string
+			Number int
+			Title  string
+		} `json:"parent"`
+	} `json:"content"`
+	FieldValues struct {
+		Nodes []struct {
+			TypeName string `json:"__typename"`
+			Field    struct {
+				Name string
+			} `json:"field,omitempty"`
+			Number *float64 `json:"number,omitempty"`
+			Name   *string  `json:"name,omitempty"`
+			Title  string   `json:"title,omitempty"`
+			Text   string   `json:"text,omitempty"`
+			Date   string   `json:"date,omitempty"`
+		}
+	}
+}, sizeLabel string) IssueTimeInfo {
+	// 作成日時をパース
+	createdAtUTC, err := time.Parse(time.RFC3339, node.Content.CreatedAt)
+	if err != nil {
+		log.Printf("Error parsing createdAt time for issue #%d: %v", node.Content.Number, err)
+	}
+	// UTCからJSTへ変換
+	createdAtJST := createdAtUTC.In(jst)
+
+	// 閉じられた日時をパース
+	var closedAt *time.Time
+	if node.Content.ClosedAt != nil {
+		// GitHubから返される時刻はUTCなのでパース後にJSTに変換
+		parsedTimeUTC, err := time.Parse(time.RFC3339, *node.Content.ClosedAt)
+		if err != nil {
+			log.Printf("Error parsing closedAt time for issue #%d: %v", node.Content.Number, err)
+		} else {
+			// UTCからJSTに変換
+			parsedTimeJST := parsedTimeUTC.In(jst)
+			closedAt = &parsedTimeJST
+		}
+	}
+
+	// アサインされたユーザーの取得
+	assignees := make([]string, 0, len(node.Content.Assignees.Nodes))
+	for _, assignee := range node.Content.Assignees.Nodes {
+		assignees = append(assignees, assignee.Login)
+	}
+
+	// ラベルの取得
+	labels := make([]string, 0, len(node.Content.Labels.Nodes))
+	for _, label := range node.Content.Labels.Nodes {
+		labels = append(labels, label.Name)
+	}
+
+	// 状態理由の取得
+	stateReason := ""
+	if node.Content.StateReason != nil {
+		stateReason = *node.Content.StateReason
+	}
+
+	// カスタムフィールドから見積時間、実績時間、サイズを取得
+	estimatedTime, actualTime, size := -1.0, -1.0, -1.0
+
+	for _, fieldValue := range node.FieldValues.Nodes {
+		if fieldValue.TypeName == "ProjectV2ItemFieldNumberValue" && fieldValue.Number != nil {
+			switch fieldValue.Field.Name {
+			case estimatedLabel:
+				estimatedTime = *fieldValue.Number
+			case actualLabel:
+				actualTime = *fieldValue.Number
+			case sizeLabel:
+				size = *fieldValue.Number
+			}
+		}
+	}
+
+	// 親Issueの情報を取得
+	parentURL := ""
+	if node.Content.Parent != nil {
+		parentURL = node.Content.Parent.URL
+	}
+
+	// ルートIssueかどうかを判定（親がないかつpbi/dev-pbiラベルを持つ）
+	isRoot := node.Content.Parent == nil && (containsLabel(labels, pbiLabel) || containsLabel(labels, devPbiLabel))
+
+	// IssueTimeInfoの作成
+	return IssueTimeInfo{
+		IssueURL:      node.Content.URL,
+		IssueNumber:   node.Content.Number,
+		Title:         node.Content.Title,
+		Author:        node.Content.Author.Login,
+		Assignees:     assignees,
+		CreatedAt:     createdAtJST,
+		ClosedAt:      closedAt,
+		State:         node.Content.State,
+		StateReason:   stateReason,
+		EstimatedTime: estimatedTime,
+		ActualTime:    actualTime,
+		Size:          size,
+		Labels:        labels,
+		ParentURL:     parentURL,
+		IsRoot:        isRoot,
+		RepoOwner:     node.Content.Repository.Owner.Login,
+		RepoName:      node.Content.Repository.Name,
+	}
+}
+
+// mergeIssueData は全てのIssue情報を結合する
+func mergeIssueData(closedIssues, subIssueDetails []IssueTimeInfo) []IssueTimeInfo {
+	// 全Issueをマップに格納（URL→IssueTimeInfo）
+	issueMap := make(map[string]IssueTimeInfo)
+	for _, issue := range closedIssues {
+		issueMap[issue.IssueURL] = issue
+	}
+
+	// Sub-Issue情報を追加または更新
+	for _, subIssue := range subIssueDetails {
+		issueMap[subIssue.IssueURL] = subIssue
+	}
+
+	// マップから全てのIssueを取得
+	var allIssues []IssueTimeInfo
+	for _, issue := range issueMap {
+		allIssues = append(allIssues, issue)
+	}
+
+	return allIssues
+}
+
+// constructIssueFamilies はIssueの家族構造を構築する
+func constructIssueFamilies(issues []IssueTimeInfo) (map[string][]IssueTimeInfo, map[string]IssueTimeInfo) {
+	// ルートIssueを特定
+	rootIssues := make(map[string]IssueTimeInfo)
+	for _, issue := range issues {
+		if issue.IsRoot {
+			rootIssues[issue.IssueURL] = issue
+		}
+	}
+
+	// 親子関係をマッピング
+	childrenByParent := make(map[string][]IssueTimeInfo)
+	for _, issue := range issues {
+		if issue.ParentURL != "" {
+			childrenByParent[issue.ParentURL] = append(childrenByParent[issue.ParentURL], issue)
+		}
+	}
+
+	// ルートIssueごとにその子孫をまとめる
+	familyByRoot := make(map[string][]IssueTimeInfo)
+	for rootURL, rootIssue := range rootIssues {
+		family := []IssueTimeInfo{rootIssue}
+
+		// このルートに属する子を再帰的に追加
+		collectChildren(rootURL, childrenByParent, &family)
+
+		familyByRoot[rootURL] = family
+	}
+
+	return familyByRoot, rootIssues
+}
+
+// collectChildren は再帰的に子Issueを収集する
+func collectChildren(parentURL string, childrenByParent map[string][]IssueTimeInfo, family *[]IssueTimeInfo) {
+	children, exists := childrenByParent[parentURL]
+	if !exists {
+		return
+	}
+
+	*family = append(*family, children...)
+
+	for _, child := range children {
+		collectChildren(child.IssueURL, childrenByParent, family)
+	}
+}
+
+// analyzeIssueFamilyStats はIssue家族ごとの統計を分析する
+func analyzeIssueFamilyStats(familyByRoot map[string][]IssueTimeInfo, rootIssues map[string]IssueTimeInfo) {
+	fmt.Println("\n## Issue Families Analysis")
+
+	if len(rootIssues) == 0 {
+		fmt.Println("\nNo root issues found.")
+		return
+	}
+
+	// ルートIssueの一覧を取得してソート
+	var rootURLs []string
+	for rootURL := range rootIssues {
+		rootURLs = append(rootURLs, rootURL)
+	}
+	sort.Strings(rootURLs)
+
+	// 全体の統計
+	totalStats := struct {
+		TotalRootSize      float64
+		TotalEstimatedTime float64
+		TotalActualTime    float64
+		CompletedSbiCount  int
+		TotalRootCount     int
+		TotalSbiCount      int
+	}{0, 0, 0, 0, 0, 0}
+
+	// 各家族ごとに情報表示
+	for _, rootURL := range rootURLs {
+		rootIssue := rootIssues[rootURL]
+		family := familyByRoot[rootURL]
+
+		// ルートIssueの情報
+		rootTitle := rootIssue.Title
+		if len(rootTitle) > 50 {
+			rootTitle = rootTitle[:47] + "..."
+		}
+
+		fmt.Printf("\n### Family: [%s](%s) #%d\n\n", rootTitle, rootURL, rootIssue.IssueNumber)
+
+		// ルートIssueのサイズ
+		rootSize := "未設定"
+		if rootIssue.Size >= 0 {
+			rootSize = fmt.Sprintf("%.1f", rootIssue.Size)
+			totalStats.TotalRootSize += rootIssue.Size
+		}
+		fmt.Printf("- ルートIssueのサイズ: %s\n", rootSize)
+		totalStats.TotalRootCount++
+
+		// Sub-Issueの情報
+		var sbiIssues []IssueTimeInfo
+		var completedSbiIssues []IssueTimeInfo
+		for _, issue := range family {
+			if hasAnySbiLabel(issue.Labels) {
+				sbiIssues = append(sbiIssues, issue)
+				totalStats.TotalSbiCount++
+
+				if issue.State == "CLOSED" && issue.StateReason == "COMPLETED" {
+					completedSbiIssues = append(completedSbiIssues, issue)
+					totalStats.CompletedSbiCount++
+				}
+			}
+		}
+
+		if len(sbiIssues) > 0 {
+			fmt.Printf("\n#### Sub-issues (%d total, %d completed):\n\n", len(sbiIssues), len(completedSbiIssues))
+
+			fmt.Printf("| %-8s | %-50s | %-10s | %-10s | %-10s | %-10s |\n",
+				"Number", "Title", "State", "Estimated", "Actual", "Ratio")
+			fmt.Println("|----------|--------------------------------------------------|------------|------------|------------|------------|")
+
+			// 見積時間と実績時間の合計
+			var totalEstimated, totalActual float64
+
+			for _, sbi := range sbiIssues {
+				title := sbi.Title
+				if len(title) > 47 {
+					title = title[:44] + "..."
+				}
+
+				estimated := "未設定"
+				if sbi.EstimatedTime >= 0 {
+					estimated = fmt.Sprintf("%.1f h", sbi.EstimatedTime)
+					totalEstimated += sbi.EstimatedTime
+					totalStats.TotalEstimatedTime += sbi.EstimatedTime
+				}
+
+				actual := "未設定"
+				if sbi.ActualTime >= 0 {
+					actual = fmt.Sprintf("%.1f h", sbi.ActualTime)
+					totalActual += sbi.ActualTime
+					totalStats.TotalActualTime += sbi.ActualTime
+				}
+
+				ratio := ""
+				if sbi.EstimatedTime > 0 && sbi.ActualTime >= 0 {
+					ratio = fmt.Sprintf("%.2f", sbi.ActualTime/sbi.EstimatedTime)
+				}
+
+				fmt.Printf("| %-8d | %-50s | %-10s | %-10s | %-10s | %-10s |\n",
+					sbi.IssueNumber, title, sbi.State, estimated, actual, ratio)
+			}
+
+			// 合計行
+			overallRatio := ""
+			if totalEstimated > 0 {
+				overallRatio = fmt.Sprintf("%.2f", totalActual/totalEstimated)
+			}
+
+			fmt.Printf("| %-8s | %-50s | %-10s | %-10s | %-10s | %-10s |\n",
+				"TOTAL", "", "", fmt.Sprintf("%.1f h", totalEstimated), fmt.Sprintf("%.1f h", totalActual), overallRatio)
+
+			// サイズと時間の比較
+			if rootIssue.Size > 0 && totalActual > 0 {
+				timePerSizePoint := totalActual / rootIssue.Size
+				fmt.Printf("\n**効率**: サイズポイントあたりの実績時間: %.2f時間/ポイント\n", timePerSizePoint)
+			}
+		} else {
+			fmt.Println("\n- この家族にはSub-issueがありません")
+		}
+	}
+
+	// 全体サマリー
+	fmt.Println("\n## 全体のサマリー\n")
+	fmt.Printf("- 分析したルートIssue数: %d\n", totalStats.TotalRootCount)
+	fmt.Printf("- 合計Sub-issue数: %d (完了: %d, %.1f%%)\n",
+		totalStats.TotalSbiCount,
+		totalStats.CompletedSbiCount,
+		float64(totalStats.CompletedSbiCount)/float64(totalStats.TotalSbiCount)*100)
+	fmt.Printf("- 合計サイズポイント: %.1f\n", totalStats.TotalRootSize)
+	fmt.Printf("- 合計見積時間: %.1f時間\n", totalStats.TotalEstimatedTime)
+	fmt.Printf("- 合計実績時間: %.1f時間\n", totalStats.TotalActualTime)
+
+	// 全体の効率
+	if totalStats.TotalRootSize > 0 && totalStats.TotalActualTime > 0 {
+		overallEfficiency := totalStats.TotalActualTime / totalStats.TotalRootSize
+		fmt.Printf("- 全体のサイズポイントあたりの実績時間: %.2f時間/ポイント\n", overallEfficiency)
+	}
+
+	// 見積に対する実績の比率
+	if totalStats.TotalEstimatedTime > 0 {
+		overallRatio := totalStats.TotalActualTime / totalStats.TotalEstimatedTime
+		fmt.Printf("- 全体の見積と実績の比率: %.2f\n", overallRatio)
+	}
+}
+
+func main() {
+	// 環境変数のロード
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using existing environment variables")
+	}
+
+	// 必要な環境変数の取得
+	org := os.Getenv("ORG")
+	if org == "" {
+		log.Fatal("ORG environment variable must be set")
+	}
+
+	projectStr := os.Getenv("PROJECT")
+	if projectStr == "" {
+		log.Fatal("PROJECT environment variable must be set")
+	}
+	projectNum, err := strconv.Atoi(projectStr)
+	if err != nil {
+		log.Fatalf("Invalid PROJECT number: %v", err)
+	}
+
+	reposStr := os.Getenv("REPOS")
+	if reposStr == "" {
+		log.Fatal("REPOS environment variable must be set")
+	}
+	repos := strings.Split(reposStr, ",")
+	// リポジトリ名をトリム
+	for i := range repos {
+		repos[i] = strings.TrimSpace(repos[i])
+	}
+
+	// サイズのカスタムフィールド名を環境変数から取得
+	sizeLabel := os.Getenv("SIZE_LABEL")
+	if sizeLabel == "" {
+		log.Fatal("SIZE_LABEL environment variable must be set")
+	}
+
+	// 日付フィルタの取得と解析 - 必須項目として扱う
+	startDateStr := os.Getenv("START_DATE")
+	if startDateStr == "" {
+		log.Fatal("START_DATE environment variable must be set")
+	}
+
+	endDateStr := os.Getenv("END_DATE")
+	if endDateStr == "" {
+		log.Fatal("END_DATE environment variable must be set")
+	}
+
+	startDate, err := parseJSTDate(startDateStr)
+	if err != nil {
+		log.Fatalf("Invalid START_DATE format: %v", err)
+	}
+
+	endDate, err := parseJSTDate(endDateStr)
+	if err != nil {
+		log.Fatalf("Invalid END_DATE format: %v", err)
+	}
+	// 終了日の終わりまでを含めるために23:59:59に設定
+	endDate = endDate.Add(24*time.Hour - time.Second)
+
+	dateRange := &DateRange{
+		StartDate: startDate,
+		EndDate:   endDate,
+	}
+
+	// GitHubトークンの取得
+	token := getGitHubToken()
+
+	// GraphQLクライアントの初期化
+	client := NewGraphQLClient(token)
+	ctx := context.Background()
+
+	// ステップ1: 指定した期間にCOMPLETEDでクローズした全てのIssueを取得
+	log.Println("Step 1: Fetching all COMPLETED issues in the specified period...")
+	completedIssues, err := fetchClosedIssuesInPeriod(client, ctx, org, projectNum, sizeLabel, dateRange, repos)
+	if err != nil {
+		log.Fatalf("Error fetching completed issues: %v", err)
+	}
+
+	if len(completedIssues) == 0 {
+		fmt.Printf("No issues found that were closed as COMPLETED between %s and %s\n", startDateStr, endDateStr)
+		return
+	}
+
+	fmt.Printf("Found %d issues closed as COMPLETED between %s and %s in repositories: %s\n\n",
+		len(completedIssues), startDateStr, endDateStr, strings.Join(repos, ", "))
+
+	// ステップ2: ルートIssueを特定
+	log.Println("Step 2: Identifying root issues...")
+	rootIssues := identifyRootIssues(completedIssues)
+
+	if len(rootIssues) == 0 {
+		fmt.Println("No root issues found among the closed issues.")
+		return
+	}
+
+	// ステップ3: 各ルートIssueのSub-Issueを取得
+	log.Println("Step 3: Fetching sub-issues for each root issue...")
+	var allSubIssueRefs []SubIssueRef
+
+	for _, rootIssue := range rootIssues {
+		subRefs, err := getSubIssuesRefs(client, ctx, rootIssue)
+		if err != nil {
+			log.Printf("Error getting sub-issues for root issue #%d: %v", rootIssue.IssueNumber, err)
+			continue
+		}
+		allSubIssueRefs = append(allSubIssueRefs, subRefs...)
+	}
+
+	log.Printf("Found %d total sub-issues references", len(allSubIssueRefs))
+
+	// ステップ4: 取得したSub-Issueの詳細情報を検索
+	log.Println("Step 4: Fetching detailed information for sub-issues...")
+	subIssueDetails, err := fetchSubIssueDetails(client, ctx, org, projectNum, allSubIssueRefs, sizeLabel)
+	if err != nil {
+		log.Fatalf("Error fetching sub-issue details: %v", err)
+	}
+
+	// 全てのIssue情報を結合
+	allIssues := mergeIssueData(completedIssues, subIssueDetails)
+
+	// Issue家族を構築
+	familyByRoot, rootIssueMap := constructIssueFamilies(allIssues)
+
+	// 分析を実行
+	analyzeIssueFamilyStats(familyByRoot, rootIssueMap)
+}

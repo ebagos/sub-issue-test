@@ -1,0 +1,246 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/joho/godotenv"
+	"github.com/shurcooL/githubv4"
+	"golang.org/x/oauth2"
+)
+
+// headerRoundTripper injects the GraphQL-Features header for sub_issues preview.
+type headerRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("GraphQL-Features", "sub_issues")
+	return h.rt.RoundTrip(req)
+}
+
+// IssueNode holds basic GitHub issue data.
+type IssueNode struct {
+	ID       githubv4.ID
+	Number   githubv4.Int
+	URL      githubv4.URI
+	Title    githubv4.String
+	ClosedAt *githubv4.DateTime
+
+	Labels struct {
+		Nodes []struct{ Name githubv4.String }
+	} `graphql:"labels(first: 20)"`
+
+	Parent struct {
+		ID *githubv4.ID
+	} `graphql:"parent"`
+
+	Assignees struct {
+		Nodes []struct{ Login githubv4.String }
+	} `graphql:"assignees(first: 1)"`
+
+	Author struct {
+		Login githubv4.String
+	} `graphql:"author"`
+}
+
+// Violation captures URL and assignee of rule-breaking issues.
+type Violation struct {
+	URL      string
+	Assignee string
+}
+
+// issuesQuery fetches CLOSED issues from a repository.
+type issuesQuery struct {
+	Repository struct {
+		Issues struct {
+			Nodes    []IssueNode
+			PageInfo struct {
+				HasNextPage bool
+				EndCursor   githubv4.String
+			}
+		} `graphql:"issues(first: $perPage, after: $after, states: CLOSED)"`
+	} `graphql:"repository(owner: $owner, name: $name)"`
+}
+
+// subIssuesQuery fetches sub-issues for a given issue via id.
+type subIssuesQuery struct {
+	Node struct {
+		Issue struct {
+			SubIssues struct {
+				Nodes    []IssueNode
+				PageInfo struct {
+					HasNextPage bool
+					EndCursor   githubv4.String
+				}
+			} `graphql:"subIssues(first: $perPage, after: $after)"`
+		} `graphql:"... on Issue"`
+	} `graphql:"node(id: $id)"`
+}
+
+func main() {
+	// Load .env
+	godotenv.Load()
+
+	// Read parameters
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		log.Fatal("GITHUB_TOKEN is required")
+	}
+	org := os.Getenv("ORG")
+	repoList := os.Getenv("REPOS")
+	repos := strings.Split(repoList, ",")
+	startDate, err := time.Parse("2006-01-02", os.Getenv("START_DATE"))
+	if err != nil {
+		log.Fatalf("Invalid START_DATE: %v", err)
+	}
+	endDate, err := time.Parse("2006-01-02", os.Getenv("END_DATE"))
+	if err != nil {
+		log.Fatalf("Invalid END_DATE: %v", err)
+	}
+
+	// Initialize GitHub GraphQL client with preview header
+	src := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+	baseClient := oauth2.NewClient(context.Background(), src)
+	httpClient := &http.Client{Transport: headerRoundTripper{rt: baseClient.Transport}}
+	client := githubv4.NewClient(httpClient)
+
+	// 1. Fetch closed PBIs across repos
+	var allIssues []IssueNode
+	for _, repo := range repos {
+		issues, err := fetchClosedPBIs(context.Background(), client, org, repo, startDate, endDate)
+		if err != nil {
+			log.Fatalf("fetchClosedPBIs error: %v", err)
+		}
+		allIssues = append(allIssues, issues...)
+	}
+
+	// 2. Identify root issues (no parent)
+	var roots []IssueNode
+	for _, iss := range allIssues {
+		if iss.Parent.ID == nil {
+			roots = append(roots, iss)
+		}
+	}
+
+	// 3. Fetch descendants for each root
+	descMap := make(map[githubv4.ID][]IssueNode)
+	for _, root := range roots {
+		descMap[root.ID] = fetchDescendants(context.Background(), client, root.ID)
+	}
+
+	// 4. Aggregate and display
+	aggs := aggregateByRoot(roots, descMap)
+	printAggregates(aggs)
+
+	// 5. Find and display rule violations
+	violations := findRuleViolations(allIssues)
+	printViolations(violations)
+}
+
+// fetchClosedPBIs retrieves CLOSED issues labeled pbi/dev-pbi in the date range.
+func fetchClosedPBIs(ctx context.Context, client *githubv4.Client, owner, repo string, start, end time.Time) ([]IssueNode, error) {
+	var result []IssueNode
+	var after *githubv4.String
+	query := issuesQuery{}
+	for {
+		vars := map[string]interface{}{
+			"owner":   githubv4.String(owner),
+			"name":    githubv4.String(repo),
+			"perPage": githubv4.Int(100),
+			"after":   after,
+		}
+		if err := client.Query(ctx, &query, vars); err != nil {
+			return nil, err
+		}
+		for _, iss := range query.Repository.Issues.Nodes {
+			if iss.ClosedAt == nil {
+				continue
+			}
+			closed := iss.ClosedAt.Time
+			if closed.After(start) && closed.Before(end.Add(24*time.Hour)) {
+				for _, l := range iss.Labels.Nodes {
+					if l.Name == "pbi" || l.Name == "dev-pbi" {
+						result = append(result, iss)
+						break
+					}
+				}
+			}
+		}
+		if !query.Repository.Issues.PageInfo.HasNextPage {
+			break
+		}
+		after = &query.Repository.Issues.PageInfo.EndCursor
+	}
+	return result, nil
+}
+
+// fetchDescendants recursively retrieves sub-issues for a given issue ID.
+func fetchDescendants(ctx context.Context, client *githubv4.Client, id githubv4.ID) []IssueNode {
+	var all []IssueNode
+	var after *githubv4.String
+	query := subIssuesQuery{}
+	for {
+		vars := map[string]interface{}{
+			"id":      id,
+			"perPage": githubv4.Int(50),
+			"after":   after,
+		}
+		if err := client.Query(ctx, &query, vars); err != nil {
+			log.Printf("subIssueQuery error for %v: %v", id, err)
+			break
+		}
+		for _, si := range query.Node.Issue.SubIssues.Nodes {
+			all = append(all, si)
+			all = append(all, fetchDescendants(ctx, client, si.ID)...)
+		}
+		if !query.Node.Issue.SubIssues.PageInfo.HasNextPage {
+			break
+		}
+		after = &query.Node.Issue.SubIssues.PageInfo.EndCursor
+	}
+	return all
+}
+
+// Aggregate holds a root issue and its descendants.
+type Aggregate struct {
+	Root        IssueNode
+	Descendants []IssueNode
+}
+
+// aggregateByRoot groups each root with its descendants.
+func aggregateByRoot(roots []IssueNode, desc map[githubv4.ID][]IssueNode) []Aggregate {
+	var aggs []Aggregate
+	for _, root := range roots {
+		aggs = append(aggs, Aggregate{Root: root, Descendants: desc[root.ID]})
+	}
+	return aggs
+}
+
+// printAggregates outputs root and descendant counts.
+func printAggregates(aggs []Aggregate) {
+	fmt.Println("=== Aggregates ===")
+	for _, a := range aggs {
+		fmt.Printf("Root #%d (%s): %d descendants\n", a.Root.Number, string(a.Root.Title), len(a.Descendants))
+	}
+}
+
+// findRuleViolations identifies issues violating the rules (stub).
+func findRuleViolations(issues []IssueNode) []Violation {
+	var violations []Violation
+	// TODO: implement custom-field and label checks
+	return violations
+}
+
+// printViolations outputs rule violations.
+func printViolations(vs []Violation) {
+	fmt.Println("=== Rule Violations ===")
+	for _, v := range vs {
+		fmt.Printf("%s -> %s\n", v.Assignee, v.URL)
+	}
+}
